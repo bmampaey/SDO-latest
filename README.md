@@ -5,7 +5,7 @@ This repository gather the differents parts of the SDO latest website
 
 website
 -------
-All the html and css for the website. Should be installed in /var/www.html
+All the html and css for the website. Should be installed in /var/www/html/latest
 
 apache
 ------
