@@ -1,509 +1,605 @@
 #!/usr/bin/python
 # -*- coding: iso-8859-15 -*-
-import threading
-import Queue
-import sys, os, os.path, glob
-import subprocess
-import pyfits
+'''
+Deamon to generate images and videos from aia quicklook fits files for the sdodata latest website
+'''
+
+import sys, os, errno, glob
+import logging
+import argparse
 import shutil
 import signal
-import time
-from datetime import datetime, timedelta
-import dateutil.parser
-import logging
-from make_video import *
+from time import sleep
+from datetime import time, datetime, timedelta
+from dateutil.parser import parse as parse_date
+import threading
+import Queue
+import pyfits
 
-# Script to generate images and videos from aia quicklook fits files for the sdodata latest website 
+from make_video import png_to_ts_video, video_to_mp4_video
+from make_image import fits_to_png, image_to_thumbnail, image_to_button
 
-# Max number of cpu and threads
-max_cpu = 6
-max_threads = 10
-
-# Run frequency in seconds
-run_frequency = 180
-
-#Acceptable quality bits (See SDO keywords) 
-min_quality = (1 << 8) + (1 << 9) + (1 << 13) + (1 << 30)
-
-# Directoriy of the fits files
-fitsfiles_directory = '/data/SDO/public/AIA_quicklook'
-
-# Fits files wavelengths
-wavelengths = [94, 131, 171, 193, 211, 304, 335, 1600, 1700, 4500]
-
-# Directories for the images
-images_directory = '/data/SDO/latest/images'
-latest_images_directory = '/data/SDO/latest/images/latest'
-
-# Directories for the videos
-videos_directory = '/data/SDO/latest/videos'
-videos_pieces_directory = '/data/SDO/latest/videos_pieces'
-latest_videos_directory = '/data/SDO/latest/videos/latest'
-
-# Parameters to transform fits to png
-fits2png_bin = '/home/sdo/SPoCA/bin/fits2png.x'
-large_size = '1024x1024>' 
-
-# Parameters for ImageMagick
-convert_bin = 'convert'
-medium_size = '128x128>'
-small_size = '45x45>'
-
-# parameters for videos
-video_frame_rate = 16
+# Max number of concurrent threads
+max_threads = 5
 
 # Duration in hours to go back in time for the creation of images and videos
-max_time_span = 48
+time_span = 3 * 24
 
-# Duration in hours of the latest videos 
-latest_video_length = 24
+# Maximum run frequency in seconds per function
+max_run_frequency = {
+	'make_images': timedelta(minutes = 5),
+	'make_latest_images': timedelta(minutes = 5),
+	'make_video_pieces': timedelta(minutes = 10),
+	'make_latest_videos': timedelta(minutes = 10),
+	'make_daily_videos': timedelta(hours = 12),
+}
 
+# Min acceptable AIA quality bits (See AIA/SDO keywords)
+AIA_min_quality = (1 << 2) + (1 << 8) + (1 << 9) + (1 << 13) + (1 << 30)
 
+# AIA Fits files wavelengths
+AIA_wavelengths = [94, 131, 171, 193, 211, 304, 335, 1600, 1700, 4500]
 
-def setup_logging(filename = None, quiet = False, verbose = False, debug = False):
-	global logging
-	if debug:
-		logging.basicConfig(level = logging.DEBUG, format='%(levelname)-8s: %(message)s')
-	elif verbose:
-		logging.basicConfig(level = logging.INFO, format='%(levelname)-8s: %(message)s')
-	else:
-		logging.basicConfig(level = logging.CRITICAL, format='%(levelname)-8s: %(message)s')
+# Paths of the fits files
+fitsfiles_directory = '/data/SDO/public/AIA_quicklook/{wavelength:04d}/{date.year:04d}/{date.month:02d}/{date.day:02d}/H{date.hour:02d}00/'
+
+# Paths of the images
+images_directory_pattern = '/data/SDO/public/latest/images/{date.year:04d}/{date.month:02d}/{date.day:02d}/H{date.hour:02d}00/'
+latest_image_pattern = '/data/SDO/public/latest/images/latest/AIA.latest.{wavelength:04d}.quicklook.{suffix}'
+
+# Paths of the videos
+video_piece_pattern = '/data/SDO/public/latest/videos_pieces/{date.year:04d}/{date.month:02d}/{date.day:02d}/H{date.hour:02d}00/AIA.{date.year:04d}{date.month:02d}{date.day:02d}_{date.hour:02d}0000.{wavelength:04d}.quicklook.ts'
+daily_video_pattern = '/data/SDO/public/latest/videos/{date.year:04d}/{date.month:02d}/{date.day:02d}/AIA.{date.year:04d}{date.month:02d}{date.day:02d}_{date.hour:02d}0000.{wavelength:04d}.quicklook.{suffix}'
+latest_video_pattern = '/data/SDO/public/latest/videos/latest/AIA.latest.{wavelength:04d}.quicklook.{suffix}'
+
+# Parameters for images
+image_large_size = '1024x1024>'
+image_medium_size = '128x128>'
+image_small_size = '45x45>'
+
+# Parameters for videos
+video_frame_rate = 16
+
+# Duration in hours of the latest videos per wavelength
+latest_video_length = dict.fromkeys(AIA_wavelengths, 24)
+latest_video_length[4500] = 24 * 20
+
+class SharedCache(object):
+	def __init__(self):
+		self.lock = threading.Lock()
+		self.cache = dict()
 	
-	if quiet:
-		logging.root.handlers[0].setLevel(logging.CRITICAL + 10)
-	elif verbose:
-		logging.root.handlers[0].setLevel(logging.INFO)
-	else:
-		logging.root.handlers[0].setLevel(logging.CRITICAL)
+	def add(self, item):
+		self.lock.acquire()
+		self.cache[item] = datetime.now()
+		self.lock.release()
 	
-	if filename:
-		import logging.handlers
-		fh = logging.handlers.TimedRotatingFileHandler(filename, 'midnight', 1)
-		fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)-8s %(funcName)-12s %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
-		if debug:
-			fh.setLevel(logging.DEBUG)
-		else:
-			fh.setLevel(logging.INFO)
-		
-		logging.root.addHandler(fh)
-
-directory_creation_lock = threading.Lock()
+	def __contains__(self, item):
+		return item in self.cache
+	
+	def clean(self, age):
+		now = datetime.now()
+		self.lock.acquire()
+		for key, value in self.cache.iteritems():
+			if value + age < now:
+				del self.cache[key]
+		self.lock.release()
 
 def make_directory(directory):
 	'''Create a directory and all the subdirectories'''
-	if not os.path.isdir(directory):
-		basedir, trash = os.path.split(directory)
-		make_directory(basedir)
-		with directory_creation_lock:
-			if not os.path.isdir(directory):
-				os.mkdir(directory)
+	try:
+		os.makedirs(directory)
+	except OSError, why:
+		if why.errno == errno.EEXIST:
+			pass
+		else:
+			logging.critical('Cannot create directory %s: %s', directory, why)
+			raise
 
-def get_fitsfiles(directory, max_time_span):
-	
-	fitsfiles = list()
-	now = datetime.utcnow()
-	for t in range(max_time_span , -1, -1):
-		directory_date = now - timedelta(hours = t)
-		directory_path = os.path.join(directory, directory_date.strftime('%Y/%m/%d/H%H00'))
-		logging.debug("Getting fits files for directory %s", directory_path)
-		fitsfiles.extend(sorted(glob.glob(os.path.join(directory_path, '*.fits'))))
-	
-	return fitsfiles
-
+def round_to_hour(date):
+	return date.replace(minute=0, second=0, microsecond=0)
 
 def get_keywords(fitsfile, keywords):
-	result = [None]*len(keywords)
-	try:
-		hdulist = pyfits.open(fitsfile)
-		for k,keyword in enumerate(keywords):
-			for hdu in hdulist:
-				if keyword in hdu.header:
-					result[k] = hdu.header[keyword]
-					break
+	result = dict.fromkeys(keywords)
+	
+	hdulist = pyfits.open(fitsfile)
+	for hdu in hdulist:
+		for keyword in keywords:
+			if keyword in hdu.header:
+				result[keyword] = hdu.header[keyword]
 		
-		hdulist.close()
-	except IOError, why:
-		logging.critical("Error reading keywords from file %s: %s", fitsfile, str(why))
+	hdulist.close()
+	
 	return result
 
-def fits2image(fitsfile, image_directory, size):
+def get_daily_video_dates(date):
+	# There is one video starting at midnight, and one at noon
+	day = date.replace(hour=0, minute=0, second=0, microsecond=0)
 	
-	# We run fits2png to make the image
-	fits2png = [fits2png_bin, fitsfile, '-u', '-R', '512.5,512.5', '-L', '-c', '-S', size, '-O', image_directory]
-	logging.debug("About to execute: %s", ' '.join(fits2png))
-	try:
-		process = subprocess.Popen(fits2png, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-		stdout, stderr = process.communicate()
-		return_code = process.poll()
-		if return_code != 0:
-			logging.error('Failed running command %s :\nReturn code : %d\n StdOut: %s\n StdErr: %s', ' '.join(fits2png), return_code, stdout, stderr)
-			return False
-	except Exception, why:
-		logging.critical('Failed running command %s : %s', ' '.join(fits2png), str(why))
-		return False
+	if date.time() < time(hour=12):
+		return day - timedelta(hours=12), day
 	else:
-		return True
-
-def make_thumbnail(image_file, thumbnail_file, size):
-	
-	convert = [convert_bin, image_file, '-resize', size, thumbnail_file]
-	logging.debug("About to execute: %s", ' '.join(convert))
-	try:
-		process = subprocess.Popen(convert, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-		stdout, stderr = process.communicate()
-		return_code = process.poll()
-		if return_code != 0:
-			logging.error('Failed running command %s :\nReturn code : %d\n StdOut: %s\n StdErr: %s', ' '.join(convert), return_code, stdout, stderr)
-			return False
-	except Exception, why:
-		logging.critical('Failed running command %s : %s', ' '.join(convert), str(why))
-		return False
-	else:
-		return True
-
-
-def make_button(image_file, button_file, size):
-	
-	convert = [convert_bin, image_file, '-resize', size, '-fuzz', '10%', '-transparent', 'black', button_file]
-	logging.debug("About to execute: %s", ' '.join(convert))
-	try:
-		process = subprocess.Popen(convert, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-		stdout, stderr = process.communicate()
-		return_code = process.poll()
-		if return_code != 0:
-			logging.error('Failed running command %s :\nReturn code : %d\n StdOut: %s\n StdErr: %s', ' '.join(convert), return_code, stdout, stderr)
-			return False
-	except Exception, why:
-		logging.critical('Failed running command %s : %s', ' '.join(convert), str(why))
-		return False
-	else:
-		return True
-
-
-def thread_make_image(fitsfile, images_queue, images_base_directory, cpu_lock):
-	
-	# We get the necessary keywords
-	date_obs, wavelength, quality = get_keywords(fitsfile, ['DATE-OBS', 'WAVELNTH', 'QUALITY'])
-	
-	# We check the date
-	try:
-		date_obs = dateutil.parser.parse(date_obs)
-	except Exception, why:
-		logging.info("DATE-OBS keyword in file %s (%s) is invalid: %s. Skipping!", fitsfile, date_obs, str(why))
-		return
-	
-	# We check if the file already exists
-	image_directory = os.path.join(images_base_directory, date_obs.strftime('%Y/%m/%d/H%H00'))
-	image_path = os.path.join(image_directory, os.path.splitext(os.path.basename(fitsfile))[0]+ '.png')
-	if os.path.isfile(image_path):
-		logging.debug('Fits file %s already converted to image %s. Skipping!', fitsfile, image_path)
-		return
-	
-	# We check the wavelength
-	try:
-		wavelength = int(wavelength)
-	except Exception, why:
-		logging.info("WAVELNTH keyword in file %s (%s) is invalid. Skipping!", fitsfile, wavelength)
-		return
-	else:
-		if wavelength not in wavelengths:
-			logging.warning('Unknown wavelength %s for file %s. Skipping!', wavelength, fitsfile)
-			return
-	
-	# We check the quality
-	try:
-		quality = int(quality)
-	except Exception, why:
-		logging.info("QUALITY keyword in file %s (%s) is invalid. Skipping!", fitsfile, quality)
-		return
-	else:
-		if quality | min_quality != min_quality:
-			logging.info("Quality of file %s (%s) does not meet the minimum required quality, skipping!", fitsfile, quality)
-			return
-	
-	# We make the image directory
-	try:
-		make_directory(image_directory)
-	except Exception, why:
-		logging.critical("Cannot create directory %s: %s", image_directory, str(why))
-		return
-	
-	
-	# We make the image
-	with cpu_lock:
-		if terminate_thread.is_set():
-			return
-		logging.info("Making image for file %s", fitsfile)
-		if fits2image(fitsfile, image_directory, large_size):
-			images_queue.put({'date':date_obs, 'wavelength': wavelength, 'path': image_path, 'directory': image_directory})
-		
-		else:
-			logging.info('File %s not converted to image. Skipping!', fitsfile)
-
-
-def thread_make_video_piece_from_images(images_base_directory, videos_pieces_base_directory, date, wavelength, cpu_lock, video_frame_rate = 24):
-	
-	# We make the list of frames
-	images_directory = os.path.join(images_base_directory, date.strftime('%Y/%m/%d/H%H00'))
-	images = sorted(glob.glob(os.path.join(images_directory, '*%04d.png' % wavelength)))
-	
-	if len(images) < 1:
-		logging.error("No enough images found to make video piece for date %s and wavelength %d", str(date), wavelength)
-		return
-	
-	# We make the videos pieces directory
-	videos_pieces_directory = os.path.join(videos_pieces_base_directory, date.strftime('%Y/%m/%d/H%H00'))
-	try:
-		make_directory(videos_pieces_directory)
-	except Exception, why:
-		logging.critical("Cannot create directory %s: %s", videos_pieces_directory, str(why))
-		return
-	
-	# We make the video piece
-	video_path = os.path.join(videos_pieces_directory, date.strftime('AIA.%Y%m%d_%H0000.') + ('%04d.ts' % wavelength))
-	with cpu_lock:
-		if terminate_thread.is_set():
-			return
-		png_to_ts_video(images, video_path, frame_rate = video_frame_rate, video_title = None, video_size = None, video_bitrate = None, video_preset='slow')
-
-
-def thread_make_latest_video_from_videos_pieces(videos_pieces_base_directory, latest_videos_directory, date, wavelength, cpu_lock, video_frame_rate = 24, video_title = None, video_size = None, video_bitrate = None):
-	
-	# We make the list of video pieces
-	videos_pieces = list()
-	for hours in range(latest_video_length):
-		videos_pieces_directory = os.path.join(videos_pieces_base_directory, (date + timedelta(hours = hours)).strftime('%Y/%m/%d/H%H00'))
-		video_piece = sorted(glob.glob(os.path.join(videos_pieces_directory, '*%04d.ts' % wavelength)))
-		if len(video_piece) >= 1:
-			videos_pieces.append(video_piece[0])
-			if len(video_piece) > 1:
-				logging.warning("Found more than one video piece for wavelength %d in directory %s", wavelength, videos_pieces_directory)
-		else:
-			logging.warning("Found no video piece for wavelength %d in directory %s", wavelength, videos_pieces_directory)
-	
-	if not videos_pieces:
-		logging.error("No video pieces found to make video for date %s and wavelength %d", str(date), wavelength)
-		return
-	
-	# We make the latest videos directory
-	try:
-		make_directory(latest_videos_directory)
-	except Exception, why:
-		logging.critical("Cannot create directory %s: %s", latest_videos_directory, str(why))
-		return
-	
-	# We make the video
-	video_path = os.path.join(latest_videos_directory, 'AIA.latest.%04d' % wavelength)
-	with cpu_lock:
-		if terminate_thread.is_set():
-			return
-		video_to_mp4_video(videos_pieces, video_path+'.mp4', video_frame_rate, video_title, video_size, video_bitrate)
-	
-	with cpu_lock:
-		if terminate_thread.is_set():
-			return
-		video_to_webm_video(videos_pieces, video_path+'.webm', video_frame_rate, video_title, video_size, video_bitrate)
-	
-	with cpu_lock:
-		if terminate_thread.is_set():
-			return
-		video_to_ogv_video(videos_pieces, video_path+'.ogv', video_frame_rate, video_title, video_size, video_bitrate)
-
-
-def thread_make_video_from_videos_pieces(videos_pieces_base_directory, videos_base_directory, date, wavelength, cpu_lock, video_frame_rate = 24, video_title = None, video_size = None, video_bitrate = None):
-	
-	# We make the list of video pieces
-	videos_pieces = list()
-	for hours in range(24):
-		videos_pieces_directory = os.path.join(videos_pieces_base_directory, (date + timedelta(hours = hours)).strftime('%Y/%m/%d/H%H00'))
-		video_piece = sorted(glob.glob(os.path.join(videos_pieces_directory, '*%04d.ts' % wavelength)))
-		if len(video_piece) >= 1:
-			videos_pieces.append(video_piece[0])
-			if len(video_piece) > 1:
-				logging.warning("Found more than one video piece for wavelength %d in directory %s", wavelength, videos_pieces_directory)
-		else:
-			logging.warning("Found no video piece for wavelength %d in directory %s", wavelength, videos_pieces_directory)
-	
-	if not videos_pieces:
-		logging.error("No video pieces found to make video for date %s and wavelength %d", str(date), wavelength)
-		return
-	
-	# We make the latest videos directory
-	videos_directory = os.path.join(videos_base_directory, date.strftime('%Y/%m/%d/'))
-	try:
-		make_directory(videos_directory)
-	except Exception, why:
-		logging.critical("Cannot create directory %s: %s", videos_directory, str(why))
-		return
-	
-	# We make the video
-	video_path = os.path.join(videos_directory, date.strftime('AIA.%Y%m%d_%H0000.') + ('%04d.mp4' % wavelength))
-	with cpu_lock:
-		if terminate_thread.is_set():
-			return
-		video_to_mp4_video(videos_pieces, video_path, video_frame_rate, video_title, video_size, video_bitrate)
-
+		return day + timedelta(hours=12), day + timedelta(hours=24)
 
 def terminate_gracefully(signal, frame):
-	logging.info("Received signal %s: Exiting gracefully", str(signal))
-	terminate_thread.set()
+	logging.info('Received signal %s: Exiting gracefully', signal)
+	stop_daemon.set()
 	sys.exit(0)
 
-def start_thread(target, args=(), kwargs={}, name='Unknown', group=None):
-	while threading.active_count() > max(1, max_threads):
-		logging.debug("Too many threads are active, waiting")
-		time.sleep(1)
+def run_threads(target, args=(), kwargs={}):
+	threads = list()
 	
-	logging.debug("Starting thread %s", name)
-	thread = threading.Thread(group=group, name=name, target=target, args=args, kwargs=kwargs)
-	thread.daemon = True
-	thread.start()
+	# Start the threads
+	for i in range(max_threads):
+		name = target.__name__ + ('_%02d' % i)
+		logging.debug('Starting thread %s with args:\n%s\n%s', name, args, kwargs)
+		thread = threading.Thread(name=name, target=target, args=args, kwargs=kwargs)
+		thread.daemon = True
+		thread.start()
+		threads.append(thread)
+	
+	# Wait for the threads to terminate
+	for thread in threads:
+		thread.join()
 
-if __name__ == "__main__":
+def make_images():
 	
-	script_name = os.path.splitext(os.path.basename(sys.argv[0]))[0]
+	input_queue = Queue.Queue()
+	output_queue = Queue.Queue()
+	
+	# Start date of images
+	date = round_to_hour(datetime.utcnow()) - timedelta(hours = time_span)
+	
+	# Add the fitsfiles to the input queue
+	for wavelength in AIA_wavelengths:
+		for hours in range(time_span + 1):
+			directory_path = fitsfiles_directory.format(date=date + timedelta(hours = hours), wavelength=wavelength)
+			logging.debug('Getting fits files for directory %s', directory_path)
+			for fitsfile in glob.glob(os.path.join(directory_path, '*.fits')):
+				input_queue.put(fitsfile)
+	
+	# Make the images in parralel threads
+	run_threads(target=thread_make_images, kwargs={'input_queue': input_queue, 'output_queue': output_queue})
+	
+	# Extract the images from the output queue
+	images = list()
+	while not output_queue.empty():
+		try:
+			images.append(output_queue.get_nowait())
+		except Queue.Empty:
+			continue
+	
+	return images
+
+def thread_make_images(input_queue, output_queue):
+	
+	while not input_queue.empty() and not stop_daemon.is_set():
+		
+		try:
+			fitsfile = input_queue.get_nowait()
+		except Queue.Empty:
+			continue
+		
+		if fitsfile in bad_fitsfiles:
+			logging.info('Fits file %s in list of bad fits files, skipping!', fitsfile)
+			continue
+		
+		# We get the necessary keywords
+		try:
+			keywords = get_keywords(fitsfile, ['DATE-OBS', 'WAVELNTH', 'QUALITY'])
+		except Exception, why:
+			logging.error('Error reading keywords from file %s: %s, skipping!', fitsfile, why)
+			continue
+		
+		# We check the date
+		try:
+			date_obs = parse_date(keywords['DATE-OBS'])
+		except Exception, why:
+			logging.warning('DATE-OBS keyword in file %s (%s) is invalid: %s, skipping!', fitsfile, keywords['DATE-OBS'], why)
+			continue
+		
+		# We check if the file already exists
+		image_directory = images_directory_pattern.format(date=date_obs)
+		image_path = os.path.join(image_directory, os.path.splitext(os.path.basename(fitsfile))[0]+ '.png')
+		if os.path.isfile(image_path):
+			logging.debug('Fits file %s already converted to image %s, skipping!', fitsfile, image_path)
+			continue
+		
+		# We check the wavelength
+		try:
+			wavelength = int(keywords['WAVELNTH'])
+		except Exception, why:
+			logging.warning('WAVELNTH keyword in file %s (%s) is invalid, skipping!', fitsfile, keywords['WAVELNTH'])
+			continue
+		
+		if wavelength not in AIA_wavelengths:
+			logging.warning('Unknown wavelength %s for file %s, skipping!', wavelength, fitsfile)
+			continue
+		
+		# We check the quality
+		try:
+			quality = int(keywords['QUALITY'])
+		except Exception, why:
+			logging.warning('QUALITY keyword in file %s (%s) is invalid, skipping!', fitsfile, keywords['QUALITY'])
+			continue
+		
+		if quality | AIA_min_quality != AIA_min_quality:
+			logging.warning('Quality of file %s (%s) does not meet the minimum required quality, skipping!', fitsfile, quality)
+			logging.debug('Adding fitsfile %s to list of bad fitsfiles', fitsfile)
+			bad_fitsfiles.add(fitsfile)
+			continue
+		
+		# We make the image directory
+		make_directory(image_directory)
+		
+		# We make the image
+		logging.info('Making image for file %s', fitsfile)
+		if fits_to_png(fitsfile, image_directory):
+			output_queue.put({'date': date_obs, 'wavelength': wavelength, 'path': image_path})
+		
+		else:
+			logging.error('Error while making image from file %s', fitsfile)
+
+
+def make_latest_images(latest_images_to_make):
+	
+	if latest_images_to_make:
+		
+		input_queue = Queue.Queue()
+		
+		# Add the latest images to the input queue
+		for latest_image in latest_images_to_make:
+			input_queue.put(latest_image)
+		
+		# Make the latest images in parralel threads
+		run_threads(target=thread_make_latest_images, kwargs={'input_queue': input_queue})
+	
+	else:
+		logging.debug('No latest image to make')
+
+def thread_make_latest_images(input_queue):
+	
+	while not input_queue.empty() and not stop_daemon.is_set():
+		
+		try:
+			image = input_queue.get_nowait()
+		except Queue.Empty:
+			continue
+		
+		latest_image_path = latest_image_pattern.format(wavelength=image['wavelength'], suffix='large.png')
+		
+		logging.debug('Copying %s to %s', image['path'], latest_image_path)
+		try:
+			make_directory(os.path.dirname(latest_image_path))
+			shutil.copy(image['path'], latest_image_path)
+		except Exception, why:
+			logging.error('Error copying %s to %s: %s', image['path'], latest_image_path, why)
+		else:
+			# We use the large image to create the corresponding thumbnails
+			image_to_thumbnail(latest_image_path, latest_image_pattern.format(wavelength=image['wavelength'], suffix='small.png'), image_small_size)
+			image_to_thumbnail(latest_image_path, latest_image_pattern.format(wavelength=image['wavelength'], suffix='medium.png'), image_medium_size)
+			image_to_button(latest_image_path, latest_image_pattern.format(wavelength=image['wavelength'], suffix='button.png'), image_medium_size)
+
+
+def make_video_pieces(video_pieces_to_make):
+	
+	# Start date of video pieces
+	date = round_to_hour(datetime.utcnow()) - timedelta(hours = time_span)
+	
+	# Add the missing videos pieces
+	for wavelength in AIA_wavelengths:
+		for hours in range(time_span + 1):
+			video_path = video_piece_pattern.format(date = date + timedelta(hours = hours), wavelength = wavelength)
+			if not os.path.exists(video_path):
+				logging.info('Video piece %s is missing, will be made', video_path)
+				video_pieces_to_make.add((wavelength, date + timedelta(hours = hours)))
+	
+	if video_pieces_to_make:
+		
+		input_queue = Queue.Queue()
+		output_queue = Queue.Queue()
+		
+		# Add the videos pieces to the input queue
+		for video_piece in video_pieces_to_make:
+			input_queue.put(video_piece)
+		
+		# Make the videos pieces in parralel threads
+		run_threads(target=thread_make_video_pieces, kwargs={'input_queue': input_queue, 'output_queue': output_queue, 'video_frame_rate': video_frame_rate})
+		
+		# Extract the videos pieces from the output queue
+		video_pieces = list()
+		while not output_queue.empty():
+			try:
+				video_pieces.append(output_queue.get_nowait())
+			except Queue.Empty:
+				continue
+		
+		return video_pieces
+	
+	else:
+		logging.debug('No video piece to make')
+		return []
+
+
+def thread_make_video_pieces(input_queue, output_queue, video_frame_rate = 24, video_size = None, video_bitrate = None, video_title = None):
+	
+	while not input_queue.empty() and not stop_daemon.is_set():
+		
+		try:
+			wavelength, date = input_queue.get_nowait()
+		except Queue.Empty:
+			continue
+		
+		# We make the list of frames
+		images_directory = images_directory_pattern.format(date=date)
+		images = sorted(glob.glob(os.path.join(images_directory, '*%04d.quicklook.png' % wavelength)))
+		
+		if not images:
+			logging.warning('No images found to make video piece for date %s and wavelength %d, skipping!', date, wavelength)
+			continue
+		
+		video_path = video_piece_pattern.format(date=date, wavelength=wavelength)
+		make_directory(os.path.dirname(video_path))
+		
+		# We make the video piece
+		if png_to_ts_video(images, video_path, frame_rate = video_frame_rate, video_title = video_title, video_size = video_size, video_bitrate = video_bitrate, video_preset='slow'):
+			output_queue.put({'wavelength': wavelength, 'date': date, 'video_path': video_path})
+		else:
+			logging.error('Error while making video piece for date %s and wavelength %d', date, wavelength)
+
+def make_latest_videos(latest_videos_to_make):
+	
+	# Add the missing latest videos
+	for wavelength in AIA_wavelengths:
+		latest_video_path = latest_video_pattern.format(wavelength=wavelength, suffix='mp4')
+		if not os.path.exists(latest_video_path):
+			logging.info('Latest video %s is missing, will be made', latest_video_path)
+			latest_videos_to_make.add(wavelength)
+	
+	if latest_videos_to_make:
+		
+		input_queue = Queue.Queue()
+		
+		# Add the latest videos to the input queue
+		for latest_video in latest_videos_to_make:
+			input_queue.put(latest_video)
+		
+		# Make the latest videos in parralel threads
+		run_threads(target=thread_make_latest_videos, kwargs={'input_queue': input_queue, 'video_frame_rate': video_frame_rate})
+	
+	else:
+		logging.debug('No latest video to make')
+
+
+def thread_make_latest_videos(input_queue, video_frame_rate = 24, video_size = None, video_bitrate = None, video_title = None):
+	
+	while not input_queue.empty() and not stop_daemon.is_set():
+		
+		try:
+			wavelength = input_queue.get_nowait()
+		except Queue.Empty:
+			continue
+		
+		# Start date of the latest video (depends on wavelength)
+		date = round_to_hour(datetime.utcnow()) - timedelta(hours = latest_video_length[wavelength])
+		
+		# We make the list of video pieces
+		video_pieces = list()
+		for hours in range(latest_video_length[wavelength] + 1):
+			video_piece = video_piece_pattern.format(date = date + timedelta(hours = hours), wavelength = wavelength)
+			if os.path.exists(video_piece):
+				video_pieces.append(video_piece)
+			else:
+				logging.warning('Video piece %s not found, skipping!', video_piece)
+		
+		if not video_pieces:
+			logging.warning('No video pieces found to make latest video for wavelength %d, skipping!', wavelength)
+			continue
+		
+		if video_title is None:
+			video_title = 'Video of the last {hours} hours of AIA {wavelength}Å'.format(wavelength = wavelength, hours=latest_video_length[wavelength])
+		
+		# Make the video to a temp path as not to overwritte the latest video
+		video_path = latest_video_pattern.format(wavelength=wavelength, suffix='mp4')
+		temp_video_path = latest_video_pattern.format(wavelength=wavelength, suffix='tmp.mp4')
+		make_directory(os.path.dirname(temp_video_path))
+		make_directory(os.path.dirname(video_path))
+		
+		# We make the video
+		if video_to_mp4_video(video_pieces, temp_video_path, video_frame_rate, video_title, video_size, video_bitrate):
+			# Move the temp file to it's latest path
+			logging.debug('Moving file %s to %s', temp_video_path, video_path)
+			shutil.move(temp_video_path, video_path)
+		else:
+			logging.error('Error while making latest video for wavelength %d', wavelength)
+
+
+def make_daily_videos(daily_videos_to_make):
+	
+	# Start date of daily videos
+	date = round_to_hour(datetime.utcnow()) - timedelta(hours = time_span)
+	
+	# Add the missing daily videos
+	for wavelength in AIA_wavelengths:
+		for hours in range(time_span / 12):
+			for video_date in get_daily_video_dates(date + timedelta(hours = 12 * hours)):
+				video_path = daily_video_pattern.format(date = video_date, wavelength = wavelength, suffix='mp4')
+				if not os.path.exists(video_path):
+					logging.info('Video piece %s is missing, will be made', video_path)
+					daily_videos_to_make.add((wavelength, video_date))
+	
+	if daily_videos_to_make:
+		
+		input_queue = Queue.Queue()
+		
+		# Add the daily videos to the input queue
+		for daily_video in daily_videos_to_make:
+			input_queue.put(daily_video)
+		
+		# Make the daily videos in parralel threads
+		run_threads(target=thread_make_daily_videos, kwargs={'input_queue': input_queue, 'video_frame_rate': video_frame_rate})
+	else:
+		logging.debug('No daily video to make')
+
+def thread_make_daily_videos(input_queue, video_frame_rate = 24, video_size = None, video_bitrate = None, video_title = None):
+	
+	while not input_queue.empty() and not stop_daemon.is_set():
+		
+		try:
+			wavelength, date = input_queue.get_nowait()
+		except Queue.Empty:
+			continue
+		
+		# We make the list of video pieces
+		video_pieces = list()
+		for hours in range(24):
+			video_piece = video_piece_pattern.format(date = date + timedelta(hours = hours), wavelength = wavelength)
+			if os.path.exists(video_piece):
+				video_pieces.append(video_piece)
+			else:
+				logging.warning('Video piece %s not found, skipping!', video_piece)
+		
+		if not video_pieces:
+			logging.warning('No video pieces found to make daily video for date %s and wavelength %d, skipping!', date, wavelength)
+			continue
+		
+		if video_title is None:
+			video_title = 'Video of AIA {wavelength}Å from {start} to {end}'.format(wavelength = wavelength, start=date.isoformat(), end=(date+timedelta(hours=24)).isoformat())
+		
+		video_path = daily_video_pattern.format(date=date, wavelength=wavelength, suffix='mp4')
+		make_directory(os.path.dirname(video_path))
+		
+		# We make the video
+		if video_to_mp4_video(video_pieces, video_path, video_frame_rate, video_title, video_size, video_bitrate):
+			# TODO should we make a temp video
+			pass
+		else:
+			logging.error('Error while making daily video for date %s and wavelength %d', date, wavelength)
+
+
+if __name__ == '__main__':
+	
+	# You need to force this environment variable, otherwise all child process will be forced to the same CPU
+	os.environ['OPENBLAS_MAIN_FREE'] = '1'
+	
 	# Default name for the log file
-	log_filename = os.path.join('/home/sdo/latest/', script_name+'.log')
+	log_filename = os.path.splitext(sys.argv[0])[0] + '.log'
+	
+	# Get the arguments
+	parser = argparse.ArgumentParser(description='Make AIA latest images and videos')
+	parser.add_argument('--debug', '-d', default=False, action='store_true', help='Set the logging level to debug')
+	parser.add_argument('--verbose', '-v', default=False, action='store_true', help='Set the logging level to info')
+	parser.add_argument('--log_filename', '-l', default=log_filename, help='Overwrite the image if it already exists')
+	parser.add_argument('--time_span', '-t', default=time_span, type=int, help='Duration in hours to go back in time for the creation of images and videos')
+	parser.add_argument('--max_threads', '-m', default=max_threads, type=int, help='Max number of concurrent threads')
 
+	# Parse the arguments
+	args = parser.parse_args()
+	
+	if args.debug:
+		log_level = logging.DEBUG
+	elif args.verbose:
+		log_level = logging.INFO
+	else:
+		log_level = logging.ERROR
+	
+	time_span = args.time_span
+	
+	max_threads = args.max_threads
+	
 	# Setup the logging
-	setup_logging(filename = log_filename, quiet = False, verbose = False, debug = False)
+	logging.basicConfig(level = log_level, filename = args.log_filename, format='%(asctime)s %(levelname)-8s %(funcName)-12s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 	
-	log = logging.getLogger(script_name)
+	logging.info('Starting deamon')
 	
-	log.info("Starting deamon")
-
+	# The stop_daemon will tell all threads to terminate gracefully
+	stop_daemon = threading.Event()
+	
 	# We setup the termination signal
 	signal.signal(signal.SIGINT, terminate_gracefully)
 	signal.signal(signal.SIGHUP, signal.SIG_IGN)
 	signal.signal(signal.SIGQUIT, terminate_gracefully)
 	signal.signal(signal.SIGTERM, terminate_gracefully)
 	
-	# The terminate_thread will tell threads to terminate gracefully
-	terminate_thread = threading.Event()
+	# All the media to make
+	latest_images_to_make = dict()
+	video_pieces_to_make = set()
+	latest_videos_to_make = set()
+	daily_videos_to_make = set()
 	
-	# We increase the max_threads by the number of threads already running
-	max_threads += threading.active_count()
+	# Last run times of functions
+	last_run_times = dict.fromkeys(max_run_frequency.keys(), datetime.min)
 	
-	# We make a queue for the images
-	images_queue = Queue.Queue()
+	# List of bad fitsfiles not to process
+	bad_fitsfiles = SharedCache()
 	
-	# The dates of the latest images, so we don't redo unnecessary work
-	latest_image_dates = dict.fromkeys(wavelengths, None)
-	
-	cpu_lock = threading.Semaphore(max_cpu)
-	
-	start_time = time.time()
-	
-	while True:
+	while not stop_daemon.is_set():
 		
-		# The videos pieces missing or for which new frames have been created will have to be redone
-		videos_pieces_to_remake = dict()
-		now = datetime.utcnow()
-		now = datetime(year = now.year, month = now.month, day = now.day, hour = now.hour)
-		for wavelength in wavelengths:
-			videos_pieces_to_remake[wavelength] = set()
-			for hours in range(max_time_span):
-				date = now - timedelta(hours = hours)
-				video_piece_path = os.path.join(videos_pieces_directory, date.strftime('%Y/%m/%d/H%H00'), date.strftime('AIA.%Y%m%d_%H0000.') + ('%04d.ts' % wavelength))
-				if not os.path.exists(video_piece_path):
-					logging.info("Video piece %s is missing, will be remade", video_piece_path)
-					videos_pieces_to_remake[wavelength].add(date)
+		# Make the images from fits files
+		if last_run_times['make_images'] + max_run_frequency['make_images'] <= datetime.now():
+			last_run_times['make_images'] = datetime.now()
+			images = make_images()
+		else:
+			logging.debug('Not yet time to run make_images: waiting until %s', last_run_times['make_images'] + max_run_frequency['make_images'])
 		
-		# We get the fitsfiles
-		fitsfiles = get_fitsfiles(fitsfiles_directory, max_time_span)
-		
-		# We transorm the fitsfiles to images
-		while fitsfiles:
-			fitsfile = fitsfiles.pop()
-			start_thread(target=thread_make_image, args=(fitsfile, images_queue, images_directory, cpu_lock), name='thread_make_image')
-		
-		# We process the images
-		while not images_queue.empty() or threading.active_count() > 1:
+		# Process the images
+		for image in images:
+			# Add the corresponding video piece to be made
+			video_pieces_to_make.add((image['wavelength'], round_to_hour(image['date'])))
 			
-			try:
-				image = images_queue.get(True, 1)
-			except (Queue.Empty), nomore:
-				continue
+			# If the image is older than the latest, add the latest image to be made
+			if image['wavelength'] not in latest_images_to_make or image['date'] > latest_images_to_make[image['wavelength']]['date']:
+				latest_images_to_make[image['wavelength']] = image
+		
+		# Make the latest images
+		if last_run_times['make_latest_images'] + max_run_frequency['make_latest_images'] <= datetime.now():
+			last_run_times['make_latest_images'] = datetime.now()
+			make_latest_images(latest_images_to_make.values())
+		else:
+			logging.debug('Not yet time to run make_latest_images: waiting until %s', last_run_times['make_latest_images'] + max_run_frequency['make_latest_images'])
+		
+		# Make the video pieces
+		if last_run_times['make_video_pieces'] + max_run_frequency['make_video_pieces'] <= datetime.now():
+			last_run_times['make_video_pieces'] = datetime.now()
+			video_pieces = make_video_pieces(video_pieces_to_make)
+			video_pieces_to_make = set()
+		else:
+			logging.debug('Not yet time to run make_video_pieces: waiting until %s', last_run_times['make_video_pieces'] + max_run_frequency['make_video_pieces'])
+		
+		# Process the video pieces
+		for video_piece in video_pieces:
+			# Add the corresponding daily videos to be made
+			for video_date in get_daily_video_dates(video_piece['date']):
+				daily_videos_to_make.add((video_piece['wavelength'], video_date))
 			
-			# Because of the new image we need to remake the corresponding video
-			videos_pieces_to_remake[image['wavelength']].add(datetime(year = image['date'].year, month = image['date'].month, day = image['date'].day, hour = image['date'].hour))
-			
-			# We copy the latest frame as the latest image, and make thumbnails 
-			if not latest_image_dates[image['wavelength']] or image['date'] > latest_image_dates[image['wavelength']]:
-				
-				latest_image_dates[image['wavelength']] = image['date']
-				
-				latest_image_basename = 'AIA.latest.%04d' % image['wavelength']
-				latest_image_path = os.path.join(latest_images_directory, latest_image_basename + ".large.png")
-				
-				log.debug('Copying %s to %s', image['path'], latest_image_path)
-				try:
-					make_directory(latest_images_directory)
-					shutil.copy(image['path'], latest_image_path)
-				except Exception, why:
-					log.critical('Error copying %s to %s: %s', image['path'], latest_image_path, str(why))
-				
-				# We use the large image to create the corresponding thumbnails
-				if os.path.isfile(latest_image_path):
-					small_thumbnail = os.path.join(latest_images_directory, latest_image_basename + ".small.png")
-					make_thumbnail(latest_image_path, small_thumbnail, small_size)
-					medium_thumbnail = os.path.join(latest_images_directory, latest_image_basename + ".medium.png")
-					make_thumbnail(latest_image_path, medium_thumbnail, medium_size)
-					button = os.path.join(latest_images_directory, latest_image_basename + ".button.png")
-					make_button(medium_thumbnail, button, medium_size)
-					
-				else:
-					log.info('Not creating thumbnails for image %s, it is missing!', latest_image_path)
+			# Add the corresponding latest video to be made
+			if video_piece['date'] >= datetime.utcnow() - timedelta(hours = latest_video_length[video_piece['wavelength']]):
+				latest_videos_to_make.add(video_piece['wavelength'])
 		
+		# Make the latest videos
+		if last_run_times['make_latest_videos'] + max_run_frequency['make_latest_videos'] <= datetime.now():
+			last_run_times['make_latest_videos'] = datetime.now()
+			make_latest_videos(latest_videos_to_make)
+			latest_videos_to_make = set()
+		else:
+			logging.debug('Not yet time to run make_latest_videos: waiting until %s', last_run_times['make_latest_videos'] + max_run_frequency['make_latest_videos'])
 		
-		# The latest videos missing or for which new videos pieces have been created will have to be redone
-		latest_videos_to_remake = set()
-		for wavelength in wavelengths:
-				latest_video_path = os.path.join(latest_videos_directory, 'AIA.latest.%04d.mp4' % wavelength)
-				if not os.path.exists(latest_video_path):
-					logging.info("Latest video %s is missing, will be remade", latest_video_path)
-					latest_videos_to_remake.add(wavelength)
+		# Make the daily videos
+		if last_run_times['make_daily_videos'] + max_run_frequency['make_daily_videos'] <= datetime.now():
+			last_run_times['make_daily_videos'] = datetime.now()
+			make_daily_videos(daily_videos_to_make)
+			daily_videos_to_make = set()
+		else:
+			logging.debug('Not yet time to run make_daily_videos: waiting until %s', last_run_times['make_daily_videos'] + max_run_frequency['make_daily_videos'])
 		
-		now = datetime.utcnow()
-		latest_date = datetime(year = now.year, month = now.month, day = now.day, hour = now.hour) - timedelta(hours = latest_video_length)
+		# Clean the bad_fitsfiles cache
+		bad_fitsfiles.clean(timedelta(hours=time_span))
 		
-		# The videos for which new videos pieces have been created will have to be redone
-		videos_to_remake = dict()
-		for wavelength in wavelengths:
-			videos_to_remake[wavelength] = set()
+		# Compute the time of the daemon next run
+		next_run_time = min(time + max_run_frequency[name] for name, time in last_run_times.items())
+		logging.debug('Next deamon loop at %s', next_run_time)
 		
-		# We remake the videos pieces
-		for wavelength, dates in videos_pieces_to_remake.iteritems():
-			for date in dates:
-				start_thread(target=thread_make_video_piece_from_images, args=(images_directory, videos_pieces_directory, date, wavelength, cpu_lock, video_frame_rate), name='thread_make_video_piece_from_images')
-				video_date = datetime(year = date.year, month = date.month, day = date.day, hour = int(date.hour/12)*12)
-				videos_to_remake[wavelength].add(video_date)
-				videos_to_remake[wavelength].add(video_date - timedelta(hours = 12))
-				if date >= latest_date:
-					latest_videos_to_remake.add(wavelength)
+		# If it is not yet time for the next run, we sleep a little
+		while datetime.now() < next_run_time and not stop_daemon.is_set():
+			sleep(1)
 		
-		# We wait that all threads have terminated
-		while threading.active_count() > 1:
-			log.debug("Waiting: %d videos to be finished", threading.active_count() - 1)
-			time.sleep(1)
-		
-		# We remake the latest videos
-		for wavelength in latest_videos_to_remake:
-			start_thread(target=thread_make_latest_video_from_videos_pieces, args=(videos_pieces_directory, latest_videos_directory, latest_date, wavelength, cpu_lock, video_frame_rate, 'Latest video of AIA {wavelength}Å'.format(wavelength = wavelength), '720x720'), name='thread_make_video_from_videos_pieces')
-		
-		# We remake the videos
-		for wavelength, dates in videos_to_remake.iteritems():
-			for date in dates:
-				start_thread(target=thread_make_video_from_videos_pieces, args=(videos_pieces_directory, videos_directory, date, wavelength, cpu_lock, video_frame_rate), name='thread_make_video_from_videos_pieces')
-		
-		# We wait that all threads have terminated
-		while threading.active_count() > 1:
-			log.debug("Waiting: %d videos to be finished", threading.active_count() - 1)
-			time.sleep(1)
-		
-		# If it terminated faster than the run_frequency, we sleep a little
-		while (time.time() - start_time < run_frequency) and (not terminate_thread.is_set()):
-			log.debug("Going to sleep for %s more seconds.", start_time + run_frequency - time.time())
-			time.sleep(1)
-		
-		start_time = time.time()
